@@ -17,9 +17,9 @@
 #define TSINGLE_2_LONG_MS       (400u)  /*Time to consider long click*/
 #define TSINGLE_2_DOUBLE_MS     (160u)  /*Time to wait for 2nd click after first*/
 
-static void HBTask(void *pvParameters);
+static void TaskHeartBeat(void *pvParameters);
 static void TimeDispTask(void *pvParameters);
-static void CmdProcessorTask(void *pvParameters);
+static void TaskCmdProcessor(void *pvParameters);
 static void TaskButton( void *parameters );
 static void TaskSerial( void *parameters );
 static void TmrDisableAlarmCb( TimerHandle_t pxTimer );   /*Timer callback*/
@@ -45,9 +45,9 @@ static BaseType_t ValidateDate(char *data, uint16_t *year, uint8_t *month, uint8
 
 /*Handles*/
 TimerHandle_t TmrDisableAlarm;
-TaskHandle_t TDHandle;
 QueueHandle_t CmdQHandle;
 QueueHandle_t serQueue;
+SemaphoreHandle_t semHBRate;
 
 /*Global Vars*/
 static uint8_t bSetTime=0;
@@ -64,11 +64,13 @@ int main( void )
 
     SEGGER_RTT_printf(0, "Hola, soy tu amigo el reloj\npor favor configura una\nhora y fecha para empezar\na funcionar\r\n");
     /*Crear Tarea Heartbeat*/
-    xTaskCreate(HBTask,             "HBTask",       128, NULL, 1,NULL);        
+    xTaskCreate(TaskHeartBeat,      "HBTask",       128, NULL, 1u,NULL);        
     /*Tarea del Time Display*/
-    xTaskCreate(TimeDispTask,       "TimeDispTask", 200, NULL, 2,&TDHandle);   
+    xTaskCreate(TimeDispTask,       "TimeDispTask", 200, NULL, 2u,NULL);   
+    /*Tarea para Controlar el boton*/
     xTaskCreate(TaskButton,         "TaskButton",   128, NULL, 2u, NULL);        
-    xTaskCreate(CmdProcessorTask,   "CmdProcTask",  300, NULL, 1,NULL); 
+    /*Tarea para procesar los comandos*/
+    xTaskCreate(TaskCmdProcessor,   "CmdProcTask",  300, NULL, 1u,NULL); 
     /*Task to handle Serial Print*/    
     xTaskCreate(TaskSerial,         "TaskSerial",   200u, NULL, 1u, NULL );   
     /*Timer to disable Alarm*/
@@ -78,20 +80,35 @@ int main( void )
     /*Serial Queue*/
     serQueue = xQueueCreate(1,MAX_SERIALMSG_LEN);
 
+    /*Create semaphores*/
+    semHBRate=xSemaphoreCreateMutex();
+
     xQueueSend(serQueue,"AT>\r\n",10);    
 
     vTaskStartScheduler(); /*ejecutamos el kernel*/
 }
 
-static void HBTask( void *pvParameters )
+/*Task to blink the led at configurable rate*/
+static void TaskHeartBeat( void *pvParameters )
 {
+    uint16_t lHBRate=0;
     for(;;)
     {        
-        vTaskDelay( HBRate/portTICK_PERIOD_MS ); /*retardo aleatorio*/
-        vLedToggle();
+
+        /*Take the semaphore to safely read the HBRate global var
+        Probably its overkill but it serve as an example of Mutex usage*/
+        if(xSemaphoreTake(semHBRate,portMAX_DELAY)==pdTRUE)
+        {
+            lHBRate=HBRate;
+            xSemaphoreGive(semHBRate);
+            vTaskDelay( lHBRate/portTICK_PERIOD_MS ); /*retardo aleatorio*/
+            vLedToggle();
+        }
+
     }
 }
 
+/*Time and Alarm display Task*/
 static void TimeDispTask( void *pvParameters )
 {
 
@@ -99,7 +116,7 @@ static void TimeDispTask( void *pvParameters )
     uint8_t hour;
     uint8_t min;
     uint8_t sec;
-    char datetimestr[21]="DUMMYDATE";    
+    char datetimestr[21];    
     for(;;)
     {        
     
@@ -138,7 +155,7 @@ static void TimeDispTask( void *pvParameters )
     }
 }
 
-
+/*Get Date and Time into tm struct*/
 static void getdatetime(struct tm* info)
 {    
     uint8_t hour;
@@ -223,8 +240,8 @@ void vInterruptSerialRx( UART_HandleTypeDef *huart )
     intCLEAR_INTERRUPT();   /*Limpiar bandera de interrupcion*/
 }
 
-
-static void CmdProcessorTask( void *pvParameters )
+/*Command Processor Task*/
+static void TaskCmdProcessor( void *pvParameters )
 {
 
     struct tm info;
@@ -313,7 +330,12 @@ static void CmdProcessorTask( void *pvParameters )
                     lHBRate = atoi(str);
                     if(lHBRate>=10 && HBRate<=5000)
                     {
-                        HBRate=lHBRate;
+                        /*Before write the global var, take the semaphore*/
+                        if(xSemaphoreTake(semHBRate,portMAX_DELAY)==pdTRUE)
+                        {
+                            HBRate=lHBRate;
+                            xSemaphoreGive(semHBRate);
+                        }                                                
                         xQueueSend(serQueue,"OK\r\n",10);
                     }
                     else
@@ -366,7 +388,7 @@ static void CmdProcessorTask( void *pvParameters )
     }
 }
 
-
+/*Time validation Function*/
 static BaseType_t ValidateTime(char *data, uint8_t *hour, uint8_t *min, uint8_t *sec)
 {
     BaseType_t rv=pdFALSE;
@@ -406,6 +428,7 @@ static BaseType_t ValidateTime(char *data, uint8_t *hour, uint8_t *min, uint8_t 
     return rv;
 }
 
+/*Date validation Function*/
 static BaseType_t ValidateDate(char *data, uint16_t *year, uint8_t *month, uint8_t *day)
 {
     BaseType_t rv=pdFALSE;
@@ -444,6 +467,7 @@ static BaseType_t ValidateDate(char *data, uint16_t *year, uint8_t *month, uint8
     return rv;
 }
 
+/*Button Handler Task*/
 static void TaskButton( void *parameters )
 {
     t_btnstate bstate=B_IDLE;
@@ -559,7 +583,7 @@ static void cbLongRelease(void)
     BtnHeld=0;
 }
 
-/*This task only prints and goes to suspended again until next button event*/
+/*Serial Print Task*/
 static void TaskSerial( void *parameters )
 {
     char serialmsg[MAX_SERIALMSG_LEN];   
@@ -570,7 +594,6 @@ static void TaskSerial( void *parameters )
         if(xQueueReceive(serQueue,&serialmsg,portMAX_DELAY)==pdTRUE)
         {
             msglen = strlen(serialmsg);
-            //SEGGER_RTT_printf(0, serialmsg);
             vSerialSend((uint8_t *)serialmsg,msglen);
         }        
     }
